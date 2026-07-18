@@ -40,7 +40,7 @@ typedef _FreeArtworkResultNative = Void Function(Pointer<_ArtworkResult>);
 typedef _FreeArtworkResultDart = void Function(Pointer<_ArtworkResult>);
 
 DynamicLibrary _loadLibrary() {
-  if (Platform.isAndroid || Platform.isLinux) {
+  if (Platform.isAndroid) {
     return DynamicLibrary.open('liblofty_ffi.so');
   }
   if (Platform.isWindows) {

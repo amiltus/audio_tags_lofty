@@ -4,6 +4,8 @@
 * Remove tag writing, metadata hydration, HTTP fetching, implicit
   `Isolate.run`, global FFI error state, and first-picture-only selection.
 * Pin `lofty 0.22.4`; `lofty 0.24.0` does not compile on Rust 1.88.
+* Rebuild stripped Android, iOS, macOS, and Windows FFI artifacts with the
+  bounded artwork ABI; Linux is intentionally unsupported.
 
 ## 0.0.1
 

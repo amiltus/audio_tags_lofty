@@ -1,6 +1,7 @@
 # audio_tags_lofty
 
-Local embedded-audio-artwork extraction for Flutter's non-web platforms.
+Local embedded-audio-artwork extraction for Flutter on Android, iOS, macOS,
+and Windows. Linux is intentionally unsupported.
 
 This fork intentionally supports one operation: extract a front cover from a
 local audio file. It does not play or decode audio samples, write tags, fetch
@@ -45,7 +46,8 @@ cargo run --release --example extract_front_artwork_benchmark -- \
 ```
 
 Platform artifacts must be regenerated with the scripts in `scripts/` before
-publishing a release.
+publishing a release. The supported artifact set is Android, iOS, macOS, and
+Windows; do not register this package for Linux.
 
 The checked-in macOS XCFramework is 2.4 MB universal. On an Apple M3 Pro, the
 release benchmark with a 123 KB embedded JPEG measured 0.056-0.141 ms p95 over
