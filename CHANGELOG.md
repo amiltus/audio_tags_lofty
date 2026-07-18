@@ -1,3 +1,10 @@
+## 0.1.0-dev.0
+
+* Breaking: reduce the package to bounded local front-artwork extraction.
+* Remove tag writing, metadata hydration, HTTP fetching, implicit
+  `Isolate.run`, global FFI error state, and first-picture-only selection.
+* Pin `lofty 0.22.4`; `lofty 0.24.0` does not compile on Rust 1.88.
+
 ## 0.0.1
 
 * Implement basic read/write functionality

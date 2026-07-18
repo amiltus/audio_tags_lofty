@@ -1,9 +1,4 @@
-export 'package:audio_tags_lofty/src/loffy_ffi.dart'
-    show
-        AudioMetadata,
-        readMetadata,
-        readMetadataAsync,
-        readPicture,
-        readPictureAsync,
-        writeMetadata,
-        writeMetadataAsync;
+library;
+
+export 'src/audio_artwork_ffi.dart'
+    show AudioArtworkException, extractFrontArtwork, withFrontArtwork;

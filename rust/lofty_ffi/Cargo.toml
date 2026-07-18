@@ -8,6 +8,13 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-lofty = "0.24"
-tempfile = "3.6" 
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "rustls-tls-native-roots"] }
+# 0.24.0 fails to compile with Rust 1.88 in Lofty's IFF parser. Keep the
+# version aligned with the already-validated server extractor until upstream
+# ships a compatible release.
+lofty = "=0.22.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,6 +1,6 @@
 name: audio_tags_lofty
-description: "A Flutter FFI plugin based on lofty for reading and writing audio tags."
-version: 0.0.6
+description: Local, bounded embedded-audio-artwork extraction for Flutter workers.
+version: 0.1.0-dev.0
 homepage: https://github.com/AfalpHy/audio_tags_lofty
 license: "Apache-2.0"
 
@@ -11,7 +11,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  plugin_platform_interface: ^2.0.2
   ffi: ^2.1.5
 
 dev_dependencies:

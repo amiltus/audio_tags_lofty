@@ -1,671 +1,250 @@
 use std::ffi::{CStr, CString, c_char};
+use std::fs;
+use std::path::Path;
 use std::ptr;
-use std::sync::Mutex;
 
-use lofty::file::{FileType, TaggedFile, TaggedFileExt};
-use lofty::prelude::AudioFile;
+use lofty::config::ParseOptions;
+use lofty::file::TaggedFileExt;
+use lofty::picture::PictureType;
+use lofty::probe::Probe;
 
-use lofty::{
-    config::{ParseOptions, ParsingMode, WriteOptions},
-    picture::{Picture, PictureType},
-    probe::Probe,
-    tag::{Accessor, ItemKey, Tag},
-};
-
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-
-mod http_file;
-use http_file::HttpFile;
-
-use tempfile::NamedTempFile;
-
-static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
-
-fn set_last_error(msg: String) {
-    let mut guard = LAST_ERROR.lock().unwrap();
-    *guard = CString::new(msg).ok();
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn lofty_last_error() -> *const c_char {
-    let guard = LAST_ERROR.lock().unwrap();
-    match &*guard {
-        Some(s) => s.as_ptr(),
-        None => ptr::null(),
-    }
-}
-
-macro_rules! err {
-    ($msg:expr) => {{
-        set_last_error($msg.to_string());
-    }};
-    ($fmt:expr, $($arg:tt)*) => {{
-        set_last_error(format!($fmt, $($arg)*));
-    }};
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn lofty_clear_error() {
-    let mut guard = LAST_ERROR.lock().unwrap();
-    *guard = None;
-}
-
+/// Owned result returned across the FFI boundary.
+///
+/// A successful no-artwork result has a null `data` pointer, zero length, and
+/// a null `error` pointer. Every other result owns its data/error until freed
+/// with `lofty_free_artwork_result`.
 #[repr(C)]
-pub struct LoftyPicture {
+pub struct ArtworkResult {
     pub data: *mut u8,
-    pub len: u64,
+    pub len: usize,
+    pub error: *mut c_char,
 }
 
-#[repr(C)]
-pub struct LoftyMetadata {
-    pub format: *mut c_char,
-
-    pub title: *mut c_char,
-    pub artist: *mut c_char,
-    pub album: *mut c_char,
-    pub album_artist: *mut c_char,
-    pub genre: *mut c_char,
-
-    pub year: u32,
-    pub track: u32,
-    pub track_total: u32,
-    pub disc: u32,
-    pub disc_total: u32,
-    pub bitrate: u32,
-    pub samplerate: u32,
-    pub duration_ms: u64,
-    pub lyrics: *mut c_char,
-    pub picture: *mut LoftyPicture,
-}
-
-fn c_path<'a>(ptr: *const c_char) -> Option<&'a str> {
-    if ptr.is_null() {
-        err!("null pointer");
-        return None;
+impl ArtworkResult {
+    fn artwork(data: Vec<u8>) -> *mut Self {
+        let len = data.len();
+        let data = Box::into_raw(data.into_boxed_slice()) as *mut u8;
+        Box::into_raw(Box::new(Self {
+            data,
+            len,
+            error: ptr::null_mut(),
+        }))
     }
-    unsafe {
-        match CStr::from_ptr(ptr).to_str() {
-            Ok(s) => Some(s),
-            Err(_) => {
-                err!("invalid utf-8 string");
-                None
-            }
-        }
+
+    fn no_artwork() -> *mut Self {
+        Box::into_raw(Box::new(Self {
+            data: ptr::null_mut(),
+            len: 0,
+            error: ptr::null_mut(),
+        }))
+    }
+
+    fn error(message: impl Into<String>) -> *mut Self {
+        let error = CString::new(message.into())
+            .unwrap_or_else(|_| CString::new("Audio artwork extraction failed").unwrap())
+            .into_raw();
+        Box::into_raw(Box::new(Self {
+            data: ptr::null_mut(),
+            len: 0,
+            error,
+        }))
     }
 }
 
-fn to_c_string(s: &str) -> *mut c_char {
-    CString::new(s)
-        .map(|c| c.into_raw())
-        .unwrap_or(ptr::null_mut())
-}
-
-fn parse_headers(headers: *const c_char) -> Option<HeaderMap> {
-    let mut map = HeaderMap::new();
-
-    if headers.is_null() {
-        return Some(map);
+/// Extracts front-cover bytes from a bounded local audio file.
+///
+/// This Rust-level entry point exists for deterministic tests and benchmarks;
+/// production callers use the C ABI below.
+pub fn extract_front_artwork(
+    path: &Path,
+    max_input_bytes: u64,
+    max_artwork_bytes: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    if max_input_bytes == 0 || max_artwork_bytes == 0 {
+        return Err("Input and artwork limits must be positive".to_string());
     }
 
-    let text = c_path(headers)?;
-
-    for line in text.lines() {
-        let line = line.trim();
-
-        if line.is_empty() {
-            continue;
-        }
-
-        let (key, value) = match line.split_once(':') {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let key = key.trim();
-        let value = value.trim();
-
-        let header_name = HeaderName::from_bytes(key.as_bytes()).ok()?;
-
-        let header_value = HeaderValue::from_str(value).ok()?;
-
-        map.insert(header_name, header_value);
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Unable to read audio file metadata: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Audio input must be a regular file".to_string());
     }
-
-    Some(map)
-}
-
-fn read_tagged_file(path: &str, need_picture: bool, headers: HeaderMap) -> Option<TaggedFile> {
-    if path.starts_with("http://") || path.starts_with("https://") {
-        let http = match HttpFile::new(path, if need_picture { 1024 } else { 512 }, headers) {
-            Some(v) => v,
-            None => {
-                err!("HttpFile::new failed");
-                return None;
-            }
-        };
-
-        let probe = match Probe::new(http).guess_file_type() {
-            Ok(p) => p,
-            Err(e) => {
-                err!("guess_file_type failed: {:?}", e);
-                return None;
-            }
-        };
-
-        return match probe
-            .options(
-                ParseOptions::new()
-                    .parsing_mode(ParsingMode::Relaxed)
-                    .read_cover_art(need_picture),
-            )
-            .read()
-        {
-            Ok(v) => Some(v),
-            Err(e) => {
-                err!("read http file failed: {:?}", e);
-                None
-            }
-        };
-    }
-
-    let probe = match Probe::open(path) {
-        Ok(p) => p,
-        Err(e) => {
-            err!("open file failed: {:?}", e);
-            return None;
-        }
-    };
-
-    let probe = match probe.guess_file_type() {
-        Ok(p) => p,
-        Err(e) => {
-            err!("guess_file_type failed: {:?}", e);
-            return None;
-        }
-    };
-
-    match probe
-        .options(
-            ParseOptions::new()
-                .parsing_mode(ParsingMode::Relaxed)
-                .read_cover_art(need_picture),
-        )
-        .read()
-    {
-        Ok(v) => Some(v),
-        Err(e) => {
-            err!("read file failed: {:?}", e);
-            None
-        }
-    }
-}
-
-fn build_picture(tag: Option<&Tag>) -> *mut LoftyPicture {
-    let picture = tag
-        .and_then(|t| t.pictures().first())
-        .map(|p| p.data().to_vec());
-
-    match picture {
-        Some(mut data) => {
-            let len = data.len() as u64;
-            let ptr = data.as_mut_ptr();
-            std::mem::forget(data);
-            Box::into_raw(Box::new(LoftyPicture { data: ptr, len }))
-        }
-        None => {
-            err!("no picture found");
-            ptr::null_mut()
-        }
-    }
-}
-
-fn get_string(tag: Option<&Tag>, key: ItemKey) -> *mut c_char {
-    tag.and_then(|t| t.get_string(key))
-        .map(|s| to_c_string(s.as_ref()))
-        .unwrap_or(ptr::null_mut())
-}
-
-fn get_year(tag: Option<&Tag>) -> u32 {
-    tag.and_then(|t| t.get_string(ItemKey::RecordingDate))
-        .and_then(|s| s.get(0..4))
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn lofty_read_metadata(
-    path: *const c_char,
-    need_picture: bool,
-    headers: *const c_char,
-) -> *mut LoftyMetadata {
-    let path_str = match c_path(path) {
-        Some(p) => p,
-        None => return ptr::null_mut(),
-    };
-
-    // Parse headers
-    let header_map = match parse_headers(headers) {
-        Some(v) => v,
-        None => return ptr::null_mut(),
-    };
-
-    let tagged_file = match read_tagged_file(path_str, need_picture, header_map) {
-        Some(v) => v,
-        None => return ptr::null_mut(),
-    };
-
-    let tag = tagged_file.primary_tag();
-    let props = tagged_file.properties();
-
-    let meta = LoftyMetadata {
-        format: to_c_string(&format!("{:?}", tagged_file.file_type())),
-        title: get_string(tag, ItemKey::TrackTitle),
-        artist: get_string(tag, ItemKey::TrackArtist),
-        album: get_string(tag, ItemKey::AlbumTitle),
-        album_artist: get_string(tag, ItemKey::AlbumArtist),
-        genre: get_string(tag, ItemKey::Genre),
-        year: get_year(tag),
-        track: tag.and_then(|t| t.track()).unwrap_or(0) as u32,
-        track_total: tag.and_then(|t| t.track_total()).unwrap_or(0) as u32,
-        disc: tag.and_then(|t| t.disk()).unwrap_or(0) as u32,
-        disc_total: tag.and_then(|t| t.disk_total()).unwrap_or(0) as u32,
-        bitrate: props.audio_bitrate().unwrap_or(0) as u32,
-        samplerate: props.sample_rate().unwrap_or(0) as u32,
-        duration_ms: props.duration().as_millis() as u64,
-        lyrics: {
-            let l = get_string(tag, ItemKey::Lyrics);
-            if !l.is_null() {
-                l
-            } else {
-                get_string(tag, ItemKey::UnsyncLyrics)
-            }
-        },
-        picture: if need_picture {
-            build_picture(tag)
-        } else {
-            ptr::null_mut()
-        },
-    };
-
-    Box::into_raw(Box::new(meta))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn lofty_read_picture(
-    path: *const c_char,
-    headers: *const c_char,
-) -> *mut LoftyPicture {
-    let path_str = match c_path(path) {
-        Some(p) => p,
-        None => return ptr::null_mut(),
-    };
-
-    // Parse headers
-    let header_map = match parse_headers(headers) {
-        Some(v) => v,
-        None => return ptr::null_mut(),
-    };
-
-    let tagged_file = match read_tagged_file(path_str, true, header_map) {
-        Some(v) => v,
-        None => return ptr::null_mut(),
-    };
-
-    let pic = build_picture(tagged_file.primary_tag());
-    pic
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn lofty_free_metadata(meta: *mut LoftyMetadata) {
-    if meta.is_null() {
-        return;
-    }
-
-    unsafe {
-        let meta = Box::from_raw(meta);
-
-        if !meta.format.is_null() {
-            drop(CString::from_raw(meta.format));
-        }
-        if !meta.title.is_null() {
-            drop(CString::from_raw(meta.title));
-        }
-        if !meta.artist.is_null() {
-            drop(CString::from_raw(meta.artist));
-        }
-        if !meta.album.is_null() {
-            drop(CString::from_raw(meta.album));
-        }
-        if !meta.album_artist.is_null() {
-            drop(CString::from_raw(meta.album_artist));
-        }
-        if !meta.genre.is_null() {
-            drop(CString::from_raw(meta.genre));
-        }
-        if !meta.lyrics.is_null() {
-            drop(CString::from_raw(meta.lyrics));
-        }
-        if !meta.picture.is_null() {
-            lofty_free_picture(meta.picture);
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn lofty_free_picture(pic: *mut LoftyPicture) {
-    if pic.is_null() {
-        return;
-    }
-
-    unsafe {
-        let pic = Box::from_raw(pic);
-        drop(Vec::from_raw_parts(
-            pic.data,
-            pic.len as usize,
-            pic.len as usize,
+    if metadata.len() > max_input_bytes {
+        return Err(format!(
+            "Audio input requires {} bytes, exceeding the configured {}-byte limit",
+            metadata.len(),
+            max_input_bytes,
         ));
     }
-}
 
-/// Rules:
-/// - value == NULL  -> do not modify
-/// - value == ""    -> delete the field
-/// - otherwise      -> replace the field
-fn apply_string_field(tag: &mut Tag, key: ItemKey, value: *const c_char) -> Result<(), ()> {
-    if value.is_null() {
-        return Ok(());
-    }
+    let tagged = Probe::open(path)
+        .map_err(|error| format!("Unable to open audio file: {error}"))?
+        .guess_file_type()
+        .map_err(|error| format!("Unable to identify audio file: {error}"))?
+        .options(ParseOptions::new().read_cover_art(true))
+        .read()
+        .map_err(|error| format!("Unable to read audio tags: {error}"))?;
 
-    let value = unsafe {
-        match CStr::from_ptr(value).to_str() {
-            Ok(v) => v,
-            Err(_) => {
-                err!("invalid utf-8 string");
-                return Err(());
-            }
-        }
+    let pictures: Vec<_> = tagged
+        .tags()
+        .iter()
+        .flat_map(|tag| tag.pictures())
+        .collect();
+    let picture = select_picture(&pictures);
+    let Some(picture) = picture else {
+        return Ok(None);
     };
 
-    tag.remove_key(key);
-
-    if !value.is_empty() {
-        tag.insert_text(key, value.to_string());
+    let data = picture.data();
+    if data.is_empty() {
+        return Ok(None);
     }
-
-    Ok(())
+    if data.len() as u64 > max_artwork_bytes {
+        return Err(format!(
+            "Embedded artwork requires {} bytes, exceeding the configured {}-byte limit",
+            data.len(),
+            max_artwork_bytes,
+        ));
+    }
+    Ok(Some(data.to_vec()))
 }
 
-fn get_u32(ptr: *const u32) -> Option<u32> {
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { *ptr })
+fn select_picture<'a>(
+    pictures: &[&'a lofty::picture::Picture],
+) -> Option<&'a lofty::picture::Picture> {
+    pictures
+        .iter()
+        .copied()
+        .find(|picture| picture.pic_type() == PictureType::CoverFront)
+        .or_else(|| pictures.first().copied())
+}
+
+/// Extracts the front cover (or first cover if no front cover is present) from
+/// a local audio path. The function performs no network I/O and does not
+/// decode audio samples.
+///
+/// # Safety
+/// - `path` must be a non-null, null-terminated UTF-8 C string.
+/// - The caller must free the returned result exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lofty_extract_front_artwork(
+    path: *const c_char,
+    max_input_bytes: u64,
+    max_artwork_bytes: u64,
+) -> *mut ArtworkResult {
+    if path.is_null() {
+        return ArtworkResult::error("Audio path must not be null");
+    }
+    let path = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(path) if !path.is_empty() => Path::new(path),
+        Ok(_) => return ArtworkResult::error("Audio path must not be empty"),
+        Err(_) => return ArtworkResult::error("Audio path must be valid UTF-8"),
+    };
+    match extract_front_artwork(path, max_input_bytes, max_artwork_bytes) {
+        Ok(Some(data)) => ArtworkResult::artwork(data),
+        Ok(None) => ArtworkResult::no_artwork(),
+        Err(error) => ArtworkResult::error(error),
     }
 }
 
-fn apply_year_field(tag: &mut Tag, value: Option<u32>) {
-    if value.is_none() {
+/// Frees a result returned from `lofty_extract_front_artwork`. Passing null is
+/// a no-op.
+///
+/// # Safety
+/// - `result` must be a value returned by this library.
+/// - It must be freed at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lofty_free_artwork_result(result: *mut ArtworkResult) {
+    if result.is_null() {
         return;
     }
-
-    tag.remove_key(ItemKey::RecordingDate);
-
-    if let Some(v) = value {
-        if v != 0 {
-            tag.insert_text(ItemKey::RecordingDate, v.to_string());
-        }
+    let result = unsafe { Box::from_raw(result) };
+    if !result.data.is_null() && result.len > 0 {
+        let _ = unsafe { Vec::from_raw_parts(result.data, result.len, result.len) };
+    }
+    if !result.error.is_null() {
+        let _ = unsafe { CString::from_raw(result.error) };
     }
 }
 
-fn apply_number_pair(
-    tag: &mut Tag,
-    current: Option<u32>,
-    total: Option<u32>,
-    set_current: fn(&mut Tag, u32),
-    set_total: fn(&mut Tag, u32),
-) {
-    if let Some(c) = current {
-        if c != 0 {
-            set_current(tag, c);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lofty::picture::{MimeType, Picture};
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn rejects_empty_limits_before_opening_input() {
+        let error = extract_front_artwork(Path::new("missing.mp3"), 0, 1)
+            .expect_err("zero input limit must be rejected");
+        assert!(error.contains("limits must be positive"));
+    }
+
+    #[test]
+    fn no_artwork_result_is_a_successful_empty_result() {
+        let result = ArtworkResult::no_artwork();
+        unsafe {
+            assert!((*result).data.is_null());
+            assert_eq!((*result).len, 0);
+            assert!((*result).error.is_null());
+            lofty_free_artwork_result(result);
         }
     }
 
-    if let Some(t) = total {
-        if t != 0 {
-            set_total(tag, t);
-        }
-    }
-}
+    #[test]
+    fn prefers_front_cover_over_the_first_picture() {
+        let back =
+            Picture::new_unchecked(PictureType::CoverBack, Some(MimeType::Jpeg), None, vec![1]);
+        let front =
+            Picture::new_unchecked(PictureType::CoverFront, Some(MimeType::Jpeg), None, vec![2]);
+        let selected = select_picture(&[&back, &front]).expect("a picture should be selected");
 
-/// Rules:
-/// - data == NULL && len == 0  -> do not modify
-/// - data == NULL && len != 0  -> delete picture
-/// - data != NULL && len > 0   -> write / replace picture
-/// - otherwise                 -> invalid
-fn apply_picture_field(tag: &mut Tag, data: *const u8, len: usize) -> Result<(), ()> {
-    if data.is_null() {
-        if len == 0 {
-            return Ok(());
-        }
-
-        while !tag.pictures().is_empty() {
-            tag.remove_picture(0);
-        }
-        return Ok(());
+        assert_eq!(selected.data(), &[2]);
     }
 
-    if len == 0 {
-        err!("invalid picture data");
-        return Err(());
+    #[test]
+    fn extracts_artwork_from_a_valid_local_file() {
+        let artwork =
+            extract_front_artwork(&fixture("with_front_artwork.mp3"), 1024 * 1024, 1024 * 1024)
+                .expect("fixture should parse")
+                .expect("fixture should have artwork");
+
+        assert!(artwork.starts_with(&[0xFF, 0xD8, 0xFF]));
     }
 
-    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    #[test]
+    fn treats_no_artwork_as_a_successful_empty_value() {
+        let artwork =
+            extract_front_artwork(&fixture("without_artwork.mp3"), 1024 * 1024, 1024 * 1024)
+                .expect("fixture should parse");
 
-    while !tag.pictures().is_empty() {
-        tag.remove_picture(0);
+        assert!(artwork.is_none());
     }
 
-    let picture = Picture::unchecked(bytes.to_vec())
-        .pic_type(PictureType::CoverFront)
-        .build();
+    #[test]
+    fn rejects_malformed_audio_without_returning_artwork() {
+        let error = extract_front_artwork(&fixture("malformed.audio"), 1024 * 1024, 1024 * 1024)
+            .expect_err("malformed input must fail closed");
 
-    tag.push_picture(picture);
-
-    Ok(())
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn lofty_write_metadata(
-    path: *const c_char,
-
-    title: *const c_char,
-    artist: *const c_char,
-    album: *const c_char,
-    album_artist: *const c_char,
-    genre: *const c_char,
-    lyrics: *const c_char,
-
-    year: *const u32,
-
-    track: *const u32,
-    track_total: *const u32,
-
-    disc: *const u32,
-    disc_total: *const u32,
-
-    picture_data: *const u8,
-    picture_len: usize,
-
-    headers: *const c_char,
-) -> bool {
-    let original_path = match c_path(path) {
-        Some(p) => p,
-        None => return false,
-    };
-
-    let headers = match parse_headers(headers) {
-        Some(h) => h,
-        None => {
-            err!("parse_headers failed");
-            return false;
-        }
-    };
-
-    let mut temp_file_opt: Option<NamedTempFile> = None;
-
-    let path_str: &str;
-
-    // HTTP/WebDAV
-    if original_path.starts_with("http://") || original_path.starts_with("https://") {
-        let tmp = match download_http_to_temp(original_path, &headers) {
-            Some(f) => f,
-            None => {
-                err!("download_http_to_temp failed");
-                return false;
-            }
-        };
-
-        temp_file_opt = Some(tmp);
-
-        path_str = temp_file_opt
-            .as_ref()
-            .unwrap()
-            .path()
-            .to_str()
-            .unwrap_or("");
-    } else {
-        path_str = original_path;
+        assert!(!error.is_empty());
     }
 
-    let mut tagged_file = match read_tagged_file(path_str, true, headers.clone()) {
-        Some(v) => v,
-        None => return false,
-    };
-    let file_type = tagged_file.file_type();
+    #[test]
+    fn rejects_input_and_artwork_over_the_configured_limits() {
+        let path = fixture("with_front_artwork.mp3");
+        let input_bytes = fs::metadata(&path).unwrap().len();
+        let input_error = extract_front_artwork(&path, input_bytes - 1, 1024 * 1024)
+            .expect_err("input should exceed the limit");
+        assert!(input_error.contains("Audio input requires"));
 
-    let tag = match tagged_file.primary_tag_mut() {
-        Some(t) => t,
-        None => {
-            err!("no primary tag");
-            return false;
-        }
-    };
-
-    if apply_string_field(tag, ItemKey::TrackTitle, title).is_err()
-        || apply_string_field(tag, ItemKey::TrackArtist, artist).is_err()
-        || apply_string_field(tag, ItemKey::AlbumTitle, album).is_err()
-        || apply_string_field(tag, ItemKey::AlbumArtist, album_artist).is_err()
-        || apply_string_field(tag, ItemKey::Genre, genre).is_err()
-        || apply_string_field(
-            tag,
-            if file_type == FileType::Mpeg {
-                ItemKey::UnsyncLyrics
-            } else {
-                ItemKey::Lyrics
-            },
-            lyrics,
-        )
-        .is_err()
-        || apply_picture_field(tag, picture_data, picture_len).is_err()
-    {
-        err!("apply field failed");
-        return false;
-    }
-
-    apply_year_field(tag, get_u32(year));
-
-    apply_number_pair(
-        tag,
-        get_u32(track),
-        get_u32(track_total),
-        Tag::set_track,
-        Tag::set_track_total,
-    );
-
-    apply_number_pair(
-        tag,
-        get_u32(disc),
-        get_u32(disc_total),
-        Tag::set_disk,
-        Tag::set_disk_total,
-    );
-
-    let result = match tagged_file.save_to_path(path_str, WriteOptions::default()) {
-        Ok(_) => true,
-        Err(e) => {
-            err!("save_to_path failed: {:?}", e);
-            false
-        }
-    };
-
-    // upload back
-    if let Some(tmp) = temp_file_opt {
-        if !upload_temp_to_http(original_path, &tmp, &headers) {
-            err!("upload_temp_to_http failed");
-            return false;
-        }
-    }
-
-    result
-}
-
-fn download_http_to_temp(url: &str, headers: &HeaderMap) -> Option<tempfile::NamedTempFile> {
-    let client = reqwest::blocking::Client::new();
-
-    let mut resp = match client.get(url).headers(headers.clone()).send() {
-        Ok(r) => r,
-        Err(e) => {
-            err!("http request failed: {}", e);
-            return None;
-        }
-    };
-
-    if !resp.status().is_success() {
-        err!("http status error: {}", resp.status());
-        return None;
-    }
-
-    let mut tmp = match tempfile::NamedTempFile::new() {
-        Ok(t) => t,
-        Err(e) => {
-            err!("create temp file failed: {}", e);
-            return None;
-        }
-    };
-
-    if std::io::copy(&mut resp, &mut tmp).is_err() {
-        err!("copy http body failed");
-        return None;
-    }
-
-    Some(tmp)
-}
-
-fn upload_temp_to_http(url: &str, tmp: &tempfile::NamedTempFile, headers: &HeaderMap) -> bool {
-    let client = reqwest::blocking::Client::new();
-
-    let bytes = match std::fs::read(tmp.path()) {
-        Ok(b) => b,
-        Err(e) => {
-            err!("read temp file failed: {}", e);
-            return false;
-        }
-    };
-
-    let req = client.put(url).headers(headers.clone()).body(bytes);
-
-    match req.send() {
-        Ok(r) => {
-            if !r.status().is_success() {
-                err!("upload failed: {}", r.status());
-                return false;
-            }
-
-            true
-        }
-        Err(e) => {
-            err!("upload request failed: {}", e);
-            false
-        }
+        let artwork_error = extract_front_artwork(&path, 1024 * 1024, 1)
+            .expect_err("artwork should exceed the limit");
+        assert!(artwork_error.contains("Embedded artwork requires"));
     }
 }

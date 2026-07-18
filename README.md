@@ -1,81 +1,53 @@
 # audio_tags_lofty
 
-A Flutter FFI plugin based on [lofty](https://github.com/Serial-ATA/lofty-rs.git) for reading and writing audio tags.
+Local embedded-audio-artwork extraction for Flutter's non-web platforms.
 
-## Supported Formats
-
-| File Format | Metadata Format(s)           |
-|-------------|------------------------------|
-| AAC (ADTS)  | `ID3v2`, `ID3v1`             |
-| Ape         | `APE`, `ID3v2`\*, `ID3v1`    |
-| AIFF        | `ID3v2`, `Text Chunks`       |
-| FLAC        | `Vorbis Comments`, `ID3v2`\* |
-| MP3         | `ID3v2`, `ID3v1`, `APE`      |
-| MP4         | `iTunes-style ilst`          |
-| MPC         | `APE`, `ID3v2`\*, `ID3v1`\*  |
-| Opus        | `Vorbis Comments`            |
-| Ogg Vorbis  | `Vorbis Comments`            |
-| Speex       | `Vorbis Comments`            |
-| WAV         | `ID3v2`, `RIFF INFO`         |
-| WavPack     | `APE`, `ID3v1`               |
-
-\* The tag will be **read only**, due to lack of official support
+This fork intentionally supports one operation: extract a front cover from a
+local audio file. It does not play or decode audio samples, write tags, fetch
+remote URLs, or create extra Dart isolates.
 
 ## Usage
 
-~~~dart
-class AudioMetadata {
-  String? format;
-  String? title;
-  String? artist;
-  String? album;
-  String? albumArtist;
-  String? genre;
+Call this from a persistent background worker, not a Flutter UI isolate:
 
-  int? year;
-
-  int? track;
-  int? trackTotal;
-
-  int? disc;
-  int? discTotal;
-
-  int? bitrate;
-  int? samplerate;
-
-  Duration? duration;
-  String? lyrics;
-  Uint8List? pictureBytes;
-}
-
-final metadata = readMetadata(path, true /* need picture */);
-final pictureBytes = readPicture(path);
-
-/// ------------------------------------------------
-/// String field rules:
-/// - NULL  -> do not modify
-/// - ""    -> delete
-/// - other -> replace
-///
-/// Picture rules:
-/// - pictureBytes != NULL -> write / replace
-/// - pictureBytes == NULL && deletePicture == false -> do not modify
-/// - pictureBytes == NULL && deletePicture == true  -> delete
-/// ------------------------------------------------
-final success = writeMetadata(
-  path: path,
-  title: title,
-  artist: artist,
-  album: album,
-  albumArtist: albumArtist,
-  genre: genre,
-  year: year,
-  track: track,
-  trackTotal: trackTotal,
-  disc: disc,
-  discTotal: discTotal,
-  lyrics: lyrics,
-  pictureBytes: pictureBytes,
-  deletePicture: false
+```dart
+final artwork = extractFrontArtwork(
+  audioPath,
+  maxInputBytes: 20 * 1024 * 1024,
+  maxArtworkBytes: 8 * 1024 * 1024,
 );
-~~~
+```
+
+`artwork` is `null` when the file has no embedded image. Invalid, unreadable,
+or over-limit files throw [AudioArtworkException]. The returned bytes are the
+original cover data; callers own any resizing or JPEG encoding.
+
+For a thumbnail worker, use `withFrontArtwork` to resize and encode within its
+callback. It exposes a temporary native `Uint8List` view and avoids the final
+native-to-Dart copy. Do not retain or return that view.
+
+## Security and Limits
+
+- Only regular local files are accepted.
+- The input file is rejected before parsing when it exceeds `maxInputBytes`.
+- Extracted artwork is rejected when it exceeds `maxArtworkBytes`.
+- The extractor prefers a `CoverFront` image and otherwise uses the first
+  embedded image.
+
+## Development
+
+```bash
+cd rust/lofty_ffi
+cargo test
+cargo build --release
+cargo run --release --example extract_front_artwork_benchmark -- \
+  tests/fixtures/with_front_artwork.mp3 500
+```
+
+Platform artifacts must be regenerated with the scripts in `scripts/` before
+publishing a release.
+
+The checked-in macOS XCFramework is 2.4 MB universal. On an Apple M3 Pro, the
+release benchmark with a 123 KB embedded JPEG measured 0.056-0.141 ms p95 over
+three 500-iteration runs. That measures tag parsing and copying only; resize
+and JPEG encoding must be benchmarked in the consuming thumbnail worker.
